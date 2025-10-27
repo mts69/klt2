@@ -34,13 +34,18 @@ MAX_FRAMES     = 99999999
 
 ######################################################################
 # Flags
-ARCH          = sm_75
-FLAG1         = -DNDEBUG
-CPU_CFLAGS    = $(FLAG1) -I$(CPU_INCLUDE_DIR)
-GPU_CFLAGS    = $(FLAG1) -I$(GPU_INCLUDE_DIR)
-GPUFLAGS      = -Xcompiler "-fPIC" -I$(GPU_INCLUDE_DIR) -arch=$(ARCH)
+CUDA_ARCH ?= 75             
+ARCH       = sm_$(CUDA_ARCH)
+FLAG1        = -DNDEBUG
+CPU_CFLAGS   = $(FLAG1) -I$(CPU_INCLUDE_DIR)
+GPU_CFLAGS   = $(FLAG1) -I$(GPU_INCLUDE_DIR)
+GPUFLAGS = -Xcompiler "-fPIC" -I$(GPU_INCLUDE_DIR) \
+           "-gencode=arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)" \
+           "-gencode=arch=compute_$(CUDA_ARCH),code=compute_$(CUDA_ARCH)" \
+           -O3
 
-LIB           = -L/usr/local/lib -L/usr/lib
+
+LIB          = -L/usr/local/lib -L/usr/lib
 
 # CPU object files
 OBJS_CPU      = $(BUILD_DIR)/cpu_convolve.o $(BUILD_DIR)/cpu_pyramid.o \
@@ -52,7 +57,7 @@ OBJS_CPU      = $(BUILD_DIR)/cpu_convolve.o $(BUILD_DIR)/cpu_pyramid.o \
 # GPU object files  
 OBJS_GPU      = $(BUILD_DIR)/gpu_convolve.o $(BUILD_DIR)/gpu_pyramid.o \
                  $(BUILD_DIR)/gpu_klt.o $(BUILD_DIR)/gpu_klt_util.o \
-                 $(BUILD_DIR)/gpu_selectGoodFeatures_cuda.o $(BUILD_DIR)/gpu_storeFeatures.o \
+                 $(BUILD_DIR)/gpu_selectGoodFeatures.o $(BUILD_DIR)/gpu_storeFeatures.o \
                  $(BUILD_DIR)/gpu_trackFeatures.o $(BUILD_DIR)/gpu_writeFeatures.o \
                  $(BUILD_DIR)/gpu_error.o $(BUILD_DIR)/gpu_pnmio.o
 
@@ -104,7 +109,7 @@ $(BUILD_DIR)/gpu_klt.o: $(GPU_SRC_CORE)/klt.c
 	$(CC) -c $(GPU_CFLAGS) $< -o $@
 $(BUILD_DIR)/gpu_klt_util.o: $(GPU_SRC_CORE)/klt_util.c
 	$(CC) -c $(GPU_CFLAGS) $< -o $@
-$(BUILD_DIR)/gpu_selectGoodFeatures_cuda.o: $(GPU_SRC_FEATURES)/selectGoodFeatures_cuda.cu
+$(BUILD_DIR)/gpu_selectGoodFeatures.o: $(GPU_SRC_FEATURES)/selectGoodFeatures.c
 	$(NVCC) -c $(GPUFLAGS) $< -o $@
 $(BUILD_DIR)/gpu_storeFeatures.o: $(GPU_SRC_FEATURES)/storeFeatures.c
 	$(CC) -c $(GPU_CFLAGS) $< -o $@
