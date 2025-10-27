@@ -18,7 +18,7 @@ GPU_INCLUDE_DIR   = gpu/include
 EXAMPLES_DIR  = examples
 BUILD_DIR     = build
 TOOLS_DIR     = tools
-DATA_DIR      = data/football/frames
+DATA_DIR      = data/hotel/frames
 OUTPUT_DIR    = output
 PROFILE_DIR   = profiles
 
@@ -34,7 +34,7 @@ MAX_FRAMES     = 99999999
 
 ######################################################################
 # Flags
-ARCH          = sm_86
+ARCH          = sm_75
 FLAG1         = -DNDEBUG
 CPU_CFLAGS    = $(FLAG1) -I$(CPU_INCLUDE_DIR)
 GPU_CFLAGS    = $(FLAG1) -I$(GPU_INCLUDE_DIR)
