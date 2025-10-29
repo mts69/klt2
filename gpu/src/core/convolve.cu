@@ -123,48 +123,25 @@
    const int tile_start_col = blockIdx.x * tile_width - radius;
    const int tile_end_col = tile_start_col + tile_stride;
    
-   // Load data cooperatively - ensure warp threads access consecutive memory
-   for (int row = ty; row < tile_height; row += tile_height) {
-     int global_row = blockIdx.y * tile_height + row;
-     if (global_row >= nrows) continue;
-     
-     const float* row_ptr = &imgin[global_row * ncols];
-     
-     // Each warp loads consecutive columns for perfect coalescing
-     // With tile_width=32, we have one warp, but tile_stride may be > 32 (due to halo)
-     // So we loop to load all needed columns
-     
-     for (int base_col = tile_start_col; base_col < tile_end_col; base_col += WARP_SIZE) {
-       int warp_start_col = base_col + warp_id * WARP_SIZE;
-       int warp_end_col = (warp_start_col + WARP_SIZE < tile_end_col) ? warp_start_col + WARP_SIZE : tile_end_col;
-       
-       if (warp_start_col >= tile_start_col && warp_start_col < tile_end_col) {
-         // Try float4 for extra speed when aligned (8 float4s = 32 floats per warp)
-         if (warp_start_col % 4 == 0 && warp_start_col + 31 < tile_end_col && 
-             warp_start_col >= 0 && warp_start_col + 31 < ncols && lane_id < 8) {
-           // 8 threads load 8 float4s = 32 elements (perfect coalescing!)
-           float4 data = reinterpret_cast<const float4*>(&row_ptr[warp_start_col + lane_id * 4])[0];
-           int shared_base = row * tile_stride + (warp_start_col - tile_start_col);
-           s_tile[shared_base + lane_id * 4 + 0] = data.x;
-           s_tile[shared_base + lane_id * 4 + 1] = data.y;
-           s_tile[shared_base + lane_id * 4 + 2] = data.z;
-           s_tile[shared_base + lane_id * 4 + 3] = data.w;
-         } else {
-           // Scalar coalesced load: each warp thread loads consecutive memory
-           for (int global_col = warp_start_col + lane_id; global_col < warp_end_col; global_col += WARP_SIZE) {
-             float val = 0.0f;
-             if (global_col >= 0 && global_col < ncols) {
-               val = row_ptr[global_col];
-             }
-             if (global_col >= tile_start_col && global_col < tile_end_col) {
-               int local_col = global_col - tile_start_col;
-               s_tile[row * tile_stride + local_col] = val;
-             }
-           }
-         }
-       }
-     }
-   }
+  // Load data cooperatively - ensure warp threads access consecutive memory
+  // Each thread loads multiple elements along its row to fill shared memory tile
+  for (int row = ty; row < tile_height; row += tile_height) {
+    int global_row = blockIdx.y * tile_height + row;
+    if (global_row >= nrows) continue;
+    
+    const float* row_ptr = &imgin[global_row * ncols];
+    
+    // Each thread loads multiple consecutive elements (coalesced within warp)
+    // Thread tx loads elements starting at tile_start_col + tx, with stride = tile_width
+    for (int local_col = tx; local_col < tile_stride; local_col += tile_width) {
+      int global_col = tile_start_col + local_col;
+      float val = 0.0f;
+      if (global_col >= 0 && global_col < ncols) {
+        val = row_ptr[global_col];  // Threads tx=0..31 load consecutive memory (coalesced!)
+      }
+      s_tile[row * tile_stride + local_col] = val;
+    }
+  }
    __syncthreads();
    
    // Compute convolution
@@ -213,86 +190,51 @@
    const int tile_vert = tile_height + 2 * radius;
    extern __shared__ float s_tile[];
    
-   const int tx = threadIdx.x;
-   const int ty = threadIdx.y;
-   const int gx = blockIdx.x * tile_width + tx;
-   const int gy = blockIdx.y * tile_height + ty;
-   
-   // For coalescing: threads with same ty (same row in block) form warps
-   // warp_id based on tx ensures threads in warp load consecutive columns from same row
-   const int warp_id = tx / WARP_SIZE;
-   const int lane_id = tx % WARP_SIZE;
-   
-   if (gx >= ncols) return;
-   
-   // Tile start row for this block (including halo)
-   const int tile_start_row = blockIdx.y * tile_height - radius;
-   
-   // COALESCED LOADING: Load rows cooperatively using warp-level coalescing
-   // Key insight: Threads with same ty (same row) but different tx (columns) 
-   //              access consecutive memory in that row (perfect coalescing!)
-   // Strategy: Each row is loaded by threads with ty=that_row, tx=0..31 (a warp)
-   
-   for (int local_row = ty; local_row < tile_vert; local_row += tile_height) {
-     int global_row = tile_start_row + local_row;
-     
-     if (global_row >= 0 && global_row < nrows) {
-       const float* row_ptr = &imgin[global_row * ncols];
-       
-       // Load row cooperatively: threads in same row (ty) load consecutive columns
-       // Row needs (tile_width + 2*radius) elements
-       // Warp 0 (tx=0..31) loads columns [start..start+31], warp 1 loads [start+32..], etc.
-       int row_start_col = blockIdx.x * tile_width - radius;
-       int row_elements = tile_width + 2 * radius;
-       
-       // Each warp loads 32 consecutive columns from the row
-       int warp_col_base = row_start_col + warp_id * WARP_SIZE;
-       int warp_col_end = (warp_col_base + WARP_SIZE < row_start_col + row_elements) ? 
-                          warp_col_base + WARP_SIZE : row_start_col + row_elements;
-       
-       // Coalesced load: threads in warp (tx=0..31) load consecutive memory
-       for (int global_col = warp_col_base + lane_id; global_col < warp_col_end; global_col += WARP_SIZE) {
-         float val = 0.0f;
-         
-         if (global_col >= 0 && global_col < ncols) {
-           val = row_ptr[global_col];  // Perfectly coalesced: threads access consecutive memory!
-         }
-         
-         int col_offset = global_col - row_start_col;
-         if (col_offset >= 0 && col_offset < tile_stride) {
-           s_tile[local_row * tile_stride + col_offset] = val;
-         }
-       }
-       
-       // Optional: Try float4 for extra speed when aligned
-       if (warp_col_base % 4 == 0 && warp_col_base + 31 < ncols && 
-           warp_col_base + 31 < row_start_col + row_elements && lane_id < 8 && 
-           (warp_col_base + lane_id * 4 + 3) < warp_col_end) {
-         // 8 threads load 8 float4s = 32 elements (perfect coalescing!)
-         float4 data = reinterpret_cast<const float4*>(&row_ptr[warp_col_base + lane_id * 4])[0];
-         int shared_base = local_row * tile_stride + (warp_col_base - row_start_col);
-         s_tile[shared_base + lane_id * 4 + 0] = data.x;
-         s_tile[shared_base + lane_id * 4 + 1] = data.y;
-         s_tile[shared_base + lane_id * 4 + 2] = data.z;
-         s_tile[shared_base + lane_id * 4 + 3] = data.w;
-       }
-     } else {
-       // Out of bounds - zero pad the row
-       int row_start_col = blockIdx.x * tile_width - radius;
-       int row_elements = tile_width + 2 * radius;
-       int warp_col_base = row_start_col + warp_id * WARP_SIZE;
-       int warp_col_end = (warp_col_base + WARP_SIZE < row_start_col + row_elements) ? 
-                          warp_col_base + WARP_SIZE : row_start_col + row_elements;
-       
-       for (int col_offset = lane_id; col_offset < row_elements; col_offset += WARP_SIZE) {
-         int global_col = warp_col_base + col_offset;
-         int local_col = global_col - row_start_col;
-         if (local_col >= 0 && local_col < tile_stride) {
-           s_tile[local_row * tile_stride + local_col] = 0.0f;
-         }
-       }
-     }
-   }
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int gx = blockIdx.x * tile_width + tx;
+  const int gy = blockIdx.y * tile_height + ty;
+  
+  if (gx >= ncols) return;
+  
+  // Tile start row for this block (including halo)
+  const int tile_start_row = blockIdx.y * tile_height - radius;
+  
+  // COALESCED LOADING: Load entire rows into shared memory (coalesced!)
+  // Then each thread reads from its column in shared memory
+  // Strategy: Threads with same ty load rows, with tx=0..31 loading consecutive columns (coalesced!)
+  // Each thread processes multiple rows to fill the tile
+  
+  const int row_start_col = blockIdx.x * tile_width - radius;
+  const int row_elements = tile_width + 2 * radius;
+  
+  // Load rows: threads with same ty load a row, with consecutive tx values loading consecutive columns
+  for (int local_row = ty; local_row < tile_vert; local_row += tile_height) {
+    int global_row = tile_start_row + local_row;
+    
+    if (global_row >= 0 && global_row < nrows) {
+      const float* row_ptr = &imgin[global_row * ncols];
+      
+      // Threads tx=0..31 load consecutive columns from this row (coalesced!)
+      for (int col_offset = tx; col_offset < row_elements; col_offset += tile_width) {
+        int global_col = row_start_col + col_offset;
+        float val = 0.0f;
+        if (global_col >= 0 && global_col < ncols) {
+          val = row_ptr[global_col];  // Coalesced access: threads load consecutive memory!
+        }
+        if (col_offset >= 0 && col_offset < tile_stride) {
+          s_tile[local_row * tile_stride + col_offset] = val;
+        }
+      }
+    } else {
+      // Out of bounds - zero pad
+      for (int col_offset = tx; col_offset < row_elements; col_offset += tile_width) {
+        if (col_offset >= 0 && col_offset < tile_stride) {
+          s_tile[local_row * tile_stride + col_offset] = 0.0f;
+        }
+      }
+    }
+  }
    
    __syncthreads();
    
@@ -571,4 +513,4 @@
      g_gpu.initialized = false;
    }
  }
- 
+  
