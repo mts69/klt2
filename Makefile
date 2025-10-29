@@ -32,7 +32,25 @@ N_FEATURES    = 150
 MAX_FRAMES     = 99999999
 
 
+
+
 ######################################################################
+
+# Detect if we're in Google Colab
+IS_COLAB := $(shell grep -qi "colab" /etc/issue 2>/dev/null && echo 1 || echo 0)
+
+# Detect if we have a Tesla T4 GPU
+HAS_T4 := $(shell nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qi "Tesla T4" && echo 1 || echo 0)
+
+# If both Colab and Tesla T4 detected, override DATA_DIR
+ifeq ($(and $(IS_COLAB),$(HAS_T4)),1)
+    override DATA_DIR = /content/frames
+    $(info ⚙️ Detected Google Colab with Tesla T4 GPU — using DATA_DIR=/content/frames)
+endif
+
+######################################################################
+
+
 # Flags
 CUDA_ARCH ?= 75             
 ARCH       = sm_$(CUDA_ARCH)
