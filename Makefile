@@ -18,7 +18,7 @@ GPU_INCLUDE_DIR   = gpu/include
 EXAMPLES_DIR  = examples
 BUILD_DIR     = build
 TOOLS_DIR     = tools
-DATA_DIR      = data/hotel/frames
+DATA_DIR      = data/heavy/frames
 OUTPUT_DIR    = output
 PROFILE_DIR   = profiles
 
