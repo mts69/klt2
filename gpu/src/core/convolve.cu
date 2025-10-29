@@ -1,3 +1,7 @@
+
+
+
+
 /*********************************************************************
  * convolve_cuda.cu - HIGHLY OPTIMIZED FOR TESLA T4 (SM_75)
  * 
@@ -72,28 +76,21 @@
      g_gpu.initialized = true;
    }
    
-   // Align to 128 bytes for optimal coalescing (32 floats = 128 bytes)
-   const size_t ALIGNMENT = 128;
-   size_t aligned_bytes = (bytes + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-   
-   if (aligned_bytes > g_gpu.allocated_size) {
+   if (bytes > g_gpu.allocated_size) {
      if (g_gpu.d_img1) {
        cudaFree(g_gpu.d_img1);
        cudaFree(g_gpu.d_img2);
      }
-     // cudaMalloc already aligns to 256 bytes by default, but we ensure 128-byte alignment
-     CUDA_CHECK(cudaMalloc(&g_gpu.d_img1, aligned_bytes));
-     CUDA_CHECK(cudaMalloc(&g_gpu.d_img2, aligned_bytes));
-     g_gpu.allocated_size = aligned_bytes;
+     CUDA_CHECK(cudaMalloc(&g_gpu.d_img1, bytes));
+     CUDA_CHECK(cudaMalloc(&g_gpu.d_img2, bytes));
+     g_gpu.allocated_size = bytes;
    }
  }
  
  /*********************************************************************
-  * OPTIMIZED HORIZONTAL CONVOLUTION WITH COALESCED ACCESS
+  * OPTIMIZED HORIZONTAL CONVOLUTION WITH FIXED FLOAT4
   * 
-  * Strategy: Warp threads load consecutive memory locations for coalescing
-  * - Each warp (32 threads) loads 32 consecutive floats (128 bytes aligned)
-  * - Use float4 when possible for 4x bandwidth
+  * Strategy: Use float4 only when column index is 4-aligned AND in bounds
   *********************************************************************/
  __global__ void convolveHoriz_Optimized(
    const float * __restrict__ imgin,
@@ -112,36 +109,49 @@
    
    const int tx = threadIdx.x;
    const int ty = threadIdx.y;
-   const int warp_id = tx / WARP_SIZE;
-   const int lane_id = tx % WARP_SIZE;
    const int gx = blockIdx.x * tile_width + tx;
    const int gy = blockIdx.y * tile_height + ty;
    
    if (gy >= nrows) return;
    
-   // Tile start column for this block (including halo)
+   // Cooperative loading with conditional float4
    const int tile_start_col = blockIdx.x * tile_width - radius;
-   const int tile_end_col = tile_start_col + tile_stride;
    
-  // Load data cooperatively - ensure warp threads access consecutive memory
-  // Each thread loads multiple elements along its row to fill shared memory tile
-  for (int row = ty; row < tile_height; row += tile_height) {
-    int global_row = blockIdx.y * tile_height + row;
-    if (global_row >= nrows) continue;
-    
-    const float* row_ptr = &imgin[global_row * ncols];
-    
-    // Each thread loads multiple consecutive elements (coalesced within warp)
-    // Thread tx loads elements starting at tile_start_col + tx, with stride = tile_width
-    for (int local_col = tx; local_col < tile_stride; local_col += tile_width) {
-      int global_col = tile_start_col + local_col;
-      float val = 0.0f;
-      if (global_col >= 0 && global_col < ncols) {
-        val = row_ptr[global_col];  // Threads tx=0..31 load consecutive memory (coalesced!)
-      }
-      s_tile[row * tile_stride + local_col] = val;
-    }
-  }
+   for (int row = ty; row < tile_height; row += tile_height) {
+     int global_row = blockIdx.y * tile_height + row;
+     if (global_row >= nrows) continue;
+     
+     const float* row_ptr = &imgin[global_row * ncols];
+     
+     // Each thread loads elements with stride = tile_width
+     for (int local_col = tx; local_col < tile_stride; local_col += tile_width) {
+       int global_col = tile_start_col + local_col;
+       
+       // Try float4 if aligned and in bounds
+       if ((global_col % 4 == 0) &&  // 4-aligned column
+           (global_col >= 0) && 
+           (global_col + 3 < ncols) &&
+           (local_col + 3 < tile_stride)) {
+         
+         // Safe float4 load
+         float4 data = reinterpret_cast<const float4*>(&row_ptr[global_col])[0];
+         s_tile[row * tile_stride + local_col + 0] = data.x;
+         s_tile[row * tile_stride + local_col + 1] = data.y;
+         s_tile[row * tile_stride + local_col + 2] = data.z;
+         s_tile[row * tile_stride + local_col + 3] = data.w;
+         
+         // Note: We still iterate with stride=tile_width, so next iteration
+         // will handle the next set. This may overlap but that's fine.
+       } else {
+         // Scalar fallback for boundaries or misalignment
+         float val = 0.0f;
+         if (global_col >= 0 && global_col < ncols) {
+           val = row_ptr[global_col];
+         }
+         s_tile[row * tile_stride + local_col] = val;
+       }
+     }
+   }
    __syncthreads();
    
    // Compute convolution
@@ -153,7 +163,7 @@
      return;
    }
    
-   // Convolve (read from shared memory - already cached)
+   // Convolve
    float sum = 0.0f;
    int s_center = ty * tile_stride + tx + radius;
    
@@ -167,12 +177,7 @@
  }
  
  /*********************************************************************
-  * OPTIMIZED VERTICAL CONVOLUTION WITH COALESCED ACCESS
-  * 
-  * Problem: Column access is strided (threads access locations ncols apart)
-  * Solution: Transpose loading pattern - load rows in shared memory, transpose
-  *          OR: Use warp-cooperative loading where warp loads consecutive rows
-  *          Strategy: Each warp loads a contiguous set of rows for all columns
+  * OPTIMIZED VERTICAL CONVOLUTION
   *********************************************************************/
  __global__ void convolveVert_Optimized(
    const float * __restrict__ imgin,
@@ -190,52 +195,26 @@
    const int tile_vert = tile_height + 2 * radius;
    extern __shared__ float s_tile[];
    
-  const int tx = threadIdx.x;
-  const int ty = threadIdx.y;
-  const int gx = blockIdx.x * tile_width + tx;
-  const int gy = blockIdx.y * tile_height + ty;
-  
-  if (gx >= ncols) return;
-  
-  // Tile start row for this block (including halo)
-  const int tile_start_row = blockIdx.y * tile_height - radius;
-  
-  // COALESCED LOADING: Load entire rows into shared memory (coalesced!)
-  // Then each thread reads from its column in shared memory
-  // Strategy: Threads with same ty load rows, with tx=0..31 loading consecutive columns (coalesced!)
-  // Each thread processes multiple rows to fill the tile
-  
-  const int row_start_col = blockIdx.x * tile_width - radius;
-  const int row_elements = tile_width + 2 * radius;
-  
-  // Load rows: threads with same ty load a row, with consecutive tx values loading consecutive columns
-  for (int local_row = ty; local_row < tile_vert; local_row += tile_height) {
-    int global_row = tile_start_row + local_row;
-    
-    if (global_row >= 0 && global_row < nrows) {
-      const float* row_ptr = &imgin[global_row * ncols];
-      
-      // Threads tx=0..31 load consecutive columns from this row (coalesced!)
-      for (int col_offset = tx; col_offset < row_elements; col_offset += tile_width) {
-        int global_col = row_start_col + col_offset;
-        float val = 0.0f;
-        if (global_col >= 0 && global_col < ncols) {
-          val = row_ptr[global_col];  // Coalesced access: threads load consecutive memory!
-        }
-        if (col_offset >= 0 && col_offset < tile_stride) {
-          s_tile[local_row * tile_stride + col_offset] = val;
-        }
-      }
-    } else {
-      // Out of bounds - zero pad
-      for (int col_offset = tx; col_offset < row_elements; col_offset += tile_width) {
-        if (col_offset >= 0 && col_offset < tile_stride) {
-          s_tile[local_row * tile_stride + col_offset] = 0.0f;
-        }
-      }
-    }
-  }
+   const int tx = threadIdx.x;
+   const int ty = threadIdx.y;
+   const int gx = blockIdx.x * tile_width + tx;
+   const int gy = blockIdx.y * tile_height + ty;
    
+   if (gx >= ncols) return;
+   
+   // Cooperative loading
+   const int tile_start_row = blockIdx.y * tile_height - radius;
+   
+   // Each thread loads a column of data
+   for (int local_row = ty; local_row < tile_vert; local_row += tile_height) {
+     int global_row = tile_start_row + local_row;
+     
+     float val = 0.0f;
+     if (global_row >= 0 && global_row < nrows && gx < ncols) {
+       val = imgin[global_row * ncols + gx];
+     }
+     s_tile[local_row * tile_stride + tx] = val;
+   }
    __syncthreads();
    
    // Compute convolution
@@ -247,7 +226,7 @@
      return;
    }
    
-   // Convolve (read from shared memory along column - already cached)
+   // Convolve
    float sum = 0.0f;
    int s_center_row = ty + radius;
    
@@ -513,4 +492,6 @@
      g_gpu.initialized = false;
    }
  }
-  
+ 
+ 
+ 
