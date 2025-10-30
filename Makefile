@@ -219,21 +219,45 @@ cpu-profile: clean lib-cpu $(OUTPUT_CPU)
 	@echo "CPU profiling complete: $(CPU_PROF_DIR)/profile.pdf"
 
 ######################################################################
-# Profiling GPU
+######################################################################
+# Profiling GPU (Nsight Compute for Colab + Tesla T4)
 gpu-profile: clean lib-gpu $(OUTPUT_GPU)
-	@echo "Profiling GPU version..."
-	$(NVCC) -pg -O3 $(GPUFLAGS) -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(FRAMES_GPU)/"' \
+	@echo "=========================================================="
+	@echo "🚀 Profiling GPU version with Nsight Compute (T4 / Colab)"
+	@echo "=========================================================="
+	$(NVCC) -O3 -lineinfo $(GPUFLAGS) \
+		-DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(FRAMES_GPU)/"' \
 		-DMAX_FRAMES=$(MAX_FRAMES) -DN_FEATURES=$(N_FEATURES) \
 		-o main_gpu $(EXAMPLES_DIR)/main_gpu.c -L. -lklt_gpu $(LIB) -lm
-	./main_gpu
+
+	# Run Nsight Compute to profile the main kernel
 	$(eval PROFILE_TIMESTAMP := $(shell date +%Y%m%d_%H%M%S))
 	$(eval GPU_PROF_DIR := $(PROFILE_DIR)/gpu/test_$(PROFILE_TIMESTAMP))
 	mkdir -p $(GPU_PROF_DIR)
-	mv gmon.out $(GPU_PROF_DIR)/
-	gprof ./main_gpu $(GPU_PROF_DIR)/gmon.out > $(GPU_PROF_DIR)/profile.txt
-	gprof ./main_gpu $(GPU_PROF_DIR)/gmon.out | python3 $(TOOLS_DIR)/gprof2dot.py -s -o $(GPU_PROF_DIR)/profile.dot
-	dot -Tpdf $(GPU_PROF_DIR)/profile.dot -o $(GPU_PROF_DIR)/profile.pdf
-	@echo "GPU profiling complete: $(GPU_PROF_DIR)/profile.pdf"
+
+	@echo "📊 Collecting detailed GPU metrics..."
+	@ncu --set full \
+		--metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+achieved_occupancy,warp_execution_efficiency,branch_efficiency \
+		-o $(GPU_PROF_DIR)/klt_profile ./main_gpu
+
+	@echo ""
+	@echo "🧾 Saving text summary..."
+	@ncu --csv --metrics \
+sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+achieved_occupancy,warp_execution_efficiency,branch_efficiency \
+		./main_gpu > $(GPU_PROF_DIR)/summary.csv
+
+	@echo "=========================================================="
+	@echo "✅ GPU profiling complete!"
+	@echo "Report directory: $(GPU_PROF_DIR)"
+	@echo "• Nsight Compute report : $(GPU_PROF_DIR)/klt_profile.ncu-rep"
+	@echo "• CSV summary           : $(GPU_PROF_DIR)/summary.csv"
+	@echo "=========================================================="
+	@echo "Tip: Download .ncu-rep and open locally with 'ncu-ui'"
+	@echo "=========================================================="
 
 ######################################################################
 # Cleaning
